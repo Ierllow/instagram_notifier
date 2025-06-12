@@ -16,6 +16,14 @@ class NotificationLog(models.Model):
     media_url = models.TextField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
+    @classmethod
+    def create_for_post(cls, user: LineUser, shortcode: str) -> "NotificationLog":
+        return cls(user=user, media_type=MediaType.POST, shortcode=shortcode)
+
+    @classmethod
+    def create_for_story(cls, user: LineUser, media_url: str) -> "NotificationLog":
+        return cls(user=user, media_type=MediaType.STORY, media_url=media_url)
+
 class FetchKind(models.TextChoices):
     POST = 'post', 'Post'
     STORY = 'story', 'Story'
@@ -33,3 +41,7 @@ class MediaDeletionLog(models.Model):
     file_path = models.CharField(max_length=255)
     shortcode = models.CharField(max_length=64)
     deleted_at = models.DateTimeField(auto_now_add=True)
+
+    @classmethod
+    def create(cls, file_path: str, shortcode: str) -> "MediaDeletionLog":
+        return cls(file_path=file_path, shortcode=shortcode)
