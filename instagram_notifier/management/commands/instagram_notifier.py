@@ -1,5 +1,4 @@
 from django.core.management.base import BaseCommand
-from django.db import transaction
 from instagram_notifier.models import *
 from datetime import datetime
 from selenium import webdriver
@@ -8,12 +7,11 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from typing import Optional
-from itertools import takewhile
+from itertools import takewhile, chain
 from instagram_notifier.log_helper import log_error
 from django.conf import settings
 from django.core.signing import TimestampSigner
 import os, time, httpx, asyncio, instaloader, mimetypes, shutil
-from itertools import chain
 
 SCOPES = ['https://www.googleapis.com/auth/drive.file']
 
@@ -23,22 +21,10 @@ class Command(BaseCommand):
     def handle(self, *args: tuple, **kwargs: dict) -> None:
         self.loader = instaloader.Instaloader()
 
-        profile = instaloader.Profile.from_username(self.loader.context, os.getenv("INSTAGRAM_USERNAME"))
+        self._save_media()
 
-        default_last_time = datetime.min.replace(tzinfo=None)
-        last_post_time = (log := FetchLog.objects.filter(kind=FetchKind.POST).first().last_checked_at if log else default_last_time)
-        last_story_time = (log := FetchLog.objects.filter(kind=FetchKind.STORY).first().last_checked_at if log else default_last_time)
-
-        new_posts = takewhile(lambda p: p.date_utc <= last_post_time, profile.get_posts())
-        for post in new_posts:
-            self.__save_post(post)
-
-        new_stories = chain.from_iterable(story.get_items() for story in self.loader.get_stories(userids=[profile.userid]))
-        for item in new_stories:
-            self.__save_story(item, last_story_time)
-
-    @log_error("instagram_notifier.__save_post")
-    def __save_post(self, post: instaloader.Post) -> None:
+    @log_error("instagram_notifier._save_post")
+    def _save_post(self, post: instaloader.Post) -> None:
         shortcode = post.shortcode
         post_url = f"https://www.instagram.com/p/{shortcode}/"
         folder = f"downloads/{post.date_utc.strftime('%Y%m%d')}"
@@ -46,7 +32,6 @@ class Command(BaseCommand):
         screenshot_path = os.path.join(folder, f"{shortcode}.png")
 
         self.loader.download_post(post, target=folder)
-        url = f"https://www.instagram.com/p/{shortcode}/"
         options = Options()
         options.headless = True
         options.add_argument("--window-size=1080,1920")
@@ -54,7 +39,7 @@ class Command(BaseCommand):
         options.add_argument("--disable-gpu")
         driver = webdriver.Chrome(options=options)
         try:
-            driver.get(url)
+            driver.get(post_url)
             time.sleep(3)
             driver.save_screenshot(screenshot_path)
         finally:
@@ -84,14 +69,8 @@ class Command(BaseCommand):
         if video_path and self._upload_drive(video_path, folder_id=post_folder_id):
             os.remove(video_path)
 
-        with transaction.atomic():
-            FetchLog.objects.update_or_create(kind=FetchKind.POST, defaults={"last_checked_at": post.date_utc})
-
-    @log_error("instagram_notifier.__save_story")
-    def __save_story(self, item: instaloader.StoryItem, last_time: datetime) -> None:
-        if item.date_utc <= last_time:
-            return
-
+    @log_error("instagram_notifier._save_story")
+    def _save_story(self, item: instaloader.StoryItem) -> None:
         media_url = item.video_url if item.is_video else item.url
         if NotificationLog.objects.filter(media_url=media_url).exists():
             return
@@ -126,9 +105,6 @@ class Command(BaseCommand):
         if self._upload_drive(filepath, folder_id=os.getenv("DRIVE_STORY_FOLDER_ID")):
             os.remove(filepath)
 
-        with transaction.atomic():
-            FetchLog.objects.update_or_create(kind=FetchKind.STORY, defaults={"last_checked_at": item.date_utc})
-
     @log_error("instagram_notifier._upload_drive")
     def _upload_drive(self, filepath: str, folder_id: str = None) -> None:
         try:
@@ -147,12 +123,11 @@ class Command(BaseCommand):
 
     @log_error("instagram_notifier._notify_users_async")
     async def _notify_users_async(self, msg: str, img_path: str, media_url: Optional[str] = None, shortcode: Optional[str] = None) -> None:
-        objects = NotificationLog.objects
-        is_notified = (media_url and objects.filter(media_url=media_url).exists()) or (shortcode and objects.filter(shortcode=shortcode).exists())
+        is_notified = (media_url and NotificationLog.objects.filter(media_url=media_url).exists()) or (shortcode and NotificationLog.objects.filter(shortcode=shortcode).exists())
         if is_notified:
             return
-        users = LineUser.objects.all()
-        for user in users:
+        new_notification_log_list = []
+        for user in LineUser.objects.iterator():
             headers = {"Authorization": f'Bearer {os.getenv("LINE_NOTIFY_TOKEN")}'}
             files = {"imageFile": open(img_path, "rb")}
             data = {"message": msg}
@@ -163,13 +138,38 @@ class Command(BaseCommand):
                 async with httpx.AsyncClient() as client:
                     response = await client.post("https://notify-api.line.me/api/notify", headers=headers, data=data, files=files)
                 response.raise_for_status()
-        with transaction.atomic():
-            if shortcode:
-                objects.create(user=None, media_type=MediaType.POST, shortcode=shortcode)
-            elif media_url:
-                objects.create(user=None, media_type=MediaType.STORY, media_url=media_url)
+
+            new_notification_log_list.append(NotificationLog.create_for_post(user, shortcode) if shortcode else NotificationLog.create_for_story(user, media_url))
+
+        if new_notification_log_list:
+            NotificationLog.objects.bulk_create(new_notification_log_list)
 
     @log_error("instagram_notifier._create_secure_media_url")
     def _create_secure_media_url(self, shortcode: str) -> str:
         token = TimestampSigner().sign(shortcode)
         return f"{os.getenv('SITE_URL')}/secure-media/{token}/"
+
+    @log_error("instagram_notifier._save_media")
+    def _save_media(self) -> None:
+        profile = instaloader.Profile.from_username(self.loader.context, os.getenv("INSTAGRAM_USERNAME"))
+
+        default_last_time = datetime.min.replace(tzinfo=None)
+
+        new_data_utc_list = []
+        post_log = FetchLog.objects.filter(kind=FetchKind.POST).first()
+        last_post_time = post_log.last_checked_at if post_log else default_last_time
+        new_posts = takewhile(lambda p: p.date_utc > last_post_time, profile.get_posts())
+        for post in new_posts:
+            self._save_post(post)
+
+        story_log = FetchLog.objects.filter(kind=FetchKind.STORY).first()
+        last_story_time = story_log.last_checked_at if story_log else default_last_time
+        new_stories = filter(lambda item: item.date_utc > last_story_time, chain.from_iterable(story.get_items() for story in self.loader.get_stories(userids=[profile.userid])))
+        for item in new_stories:
+            self._save_story(item)
+
+        if new_data_utc_list:
+            FetchLog.objects.bulk_create([
+                FetchLog(kind=FetchKind.POST, last_checked_at=max(post.date_utc for post in new_posts)),
+                FetchLog(kind=FetchKind.STORY, last_checked_at=max(item.date_utc for item in new_stories)),
+                ])

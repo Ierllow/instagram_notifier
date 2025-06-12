@@ -1,5 +1,4 @@
 from django.core.management.base import BaseCommand
-from django.db import transaction
 from django.conf import settings
 from instagram_notifier.models import *
 from itertools import takewhile
@@ -13,16 +12,15 @@ class Command(BaseCommand):
         folder = os.path.join(settings.MEDIA_ROOT, "instagram_media")
         expire_seconds = 7 * 24 * 60 * 60
         now = datetime.datetime.now()
-        deleted = 0
         mp4_files = glob.glob(os.path.join(folder, "**", "*.mp4"), recursive=True)
         deletable_files = takewhile(lambda p: os.path.getmtime(p) < now - datetime.timedelta(seconds=expire_seconds), mp4_files)
+        new_media_deletion_log_list = []
         for path in deletable_files:
-            filename = os.path.basename(path)
-            shortcode = os.path.splitext(os.path.basename(path))[0]
-            with transaction.atomic():
-                MediaDeletionLog.objects.create(file_name=filename, shortcode=shortcode)
+            new_media_deletion_log_list.append(MediaDeletionLog.create(os.path.basename(path), os.path.splitext(os.path.basename(path))[0]))
             os.remove(path)
-            deleted += 1
+
+        if new_media_deletion_log_list:
+            MediaDeletionLog.objects.bulk_create(new_media_deletion_log_list)
 
         folder_path = os.path.dirname(path)
         if os.path.exists(folder_path) and not os.listdir(folder_path):
