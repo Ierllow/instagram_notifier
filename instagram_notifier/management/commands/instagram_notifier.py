@@ -1,4 +1,5 @@
 from django.core.management.base import BaseCommand
+from instagram_notifier.env_const import *
 from instagram_notifier.models import *
 from datetime import datetime
 from selenium import webdriver
@@ -11,6 +12,7 @@ from itertools import takewhile, chain
 from instagram_notifier.log_helper import log_error
 from django.conf import settings
 from django.core.signing import TimestampSigner
+from pathlib import Path
 import os, time, httpx, asyncio, instaloader, mimetypes, shutil
 
 SCOPES = ['https://www.googleapis.com/auth/drive.file']
@@ -25,6 +27,8 @@ class Command(BaseCommand):
     @log_error("instagram_notifier._init")
     def _init(self) -> None:
         self.loader = instaloader.Instaloader()
+        session_path = Path.home() / f"instagram_notifier/session-{MY_INSTAGRAM_USERNAME}"
+        self.loader.load_session_from_file(username=MY_INSTAGRAM_USERNAME, filename=str(session_path))
 
         options = Options()
         options.headless = True
@@ -66,13 +70,12 @@ class Command(BaseCommand):
             else:
                 msg += f"\n\n リールのリンク（長押しで保存できます。7日間有効）:\n{self._create_secure_media_url(post.shortcode)}"
 
-        asyncio.run(self._notify_users_async(msg, screenshot_path, shortcode=shortcode))
+        asyncio.run(self._anotify_users(msg, screenshot_path, shortcode=shortcode))
 
-        post_folder_id = os.getenv("DRIVE_POST_FOLDER_ID")
-        self._upload_drive(screenshot_path, folder_id=post_folder_id)
+        self._upload_drive(screenshot_path, folder_id=POST_DRIVE_FOLDER_ID)
         os.remove(screenshot_path)
 
-        if video_path and self._upload_drive(video_path, folder_id=post_folder_id):
+        if video_path and self._upload_drive(video_path, folder_id=POST_DRIVE_FOLDER_ID):
             os.remove(video_path)
 
     @log_error("instagram_notifier._save_story")
@@ -103,15 +106,15 @@ class Command(BaseCommand):
         else:
             msg += "\n\n 画像ストーリー（長押しで保存できます）"
 
-        asyncio.run(self._notify_users_async(msg, filepath, media_url=media_url))
+        asyncio.run(self._anotify_users(msg, filepath, media_url=media_url))
 
-        if self._upload_drive(filepath, folder_id=os.getenv("DRIVE_STORY_FOLDER_ID")):
+        if self._upload_drive(filepath, folder_id=STORY_DRIVE_FOLDER_ID):
             os.remove(filepath)
 
     @log_error("instagram_notifier._upload_drive")
     def _upload_drive(self, filepath: str, folder_id: str = None) -> None:
         try:
-            credentials = service_account.Credentials.from_service_account_file(os.getenv("SERVICE_ACCOUNT_FILE"), scopes=SCOPES)
+            credentials = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
             service = build('drive', 'v3', credentials=credentials)
 
             file_metadata = {'name': os.path.basename(filepath),}
@@ -125,13 +128,13 @@ class Command(BaseCommand):
             return False
 
     @log_error("instagram_notifier._notify_users_async")
-    async def _notify_users_async(self, msg: str, img_path: str, media_url: Optional[str] = None, shortcode: Optional[str] = None) -> None:
+    async def _anotify_users(self, msg: str, img_path: str, media_url: Optional[str] = None, shortcode: Optional[str] = None) -> None:
         is_notified = (media_url and NotificationLog.objects.filter(media_url=media_url).exists()) or (shortcode and NotificationLog.objects.filter(shortcode=shortcode).exists())
         if is_notified:
             return
         new_notification_log_list = []
         for user in LineUser.objects.iterator():
-            headers = {"Authorization": f'Bearer {os.getenv("LINE_NOTIFY_TOKEN")}'}
+            headers = {"Authorization": f'Bearer {LINE_NOTIFY_TOKEN}'}
             files = {"imageFile": open(img_path, "rb")}
             data = {"message": msg}
             mine_type, _ = mimetypes.guess_type(img_path)
@@ -150,11 +153,11 @@ class Command(BaseCommand):
     @log_error("instagram_notifier._create_secure_media_url")
     def _create_secure_media_url(self, shortcode: str) -> str:
         token = TimestampSigner().sign(shortcode)
-        return f"{os.getenv('SITE_URL')}/secure-media/{token}/"
+        return f"{SITE_URL}/secure-media/{token}/"
 
     @log_error("instagram_notifier._save_media")
     def _save_media(self) -> None:
-        profile = instaloader.Profile.from_username(self.loader.context, os.getenv("INSTAGRAM_USERNAME"))
+        profile = instaloader.Profile.from_username(self.loader.context, TARGET_INSTAGRAM_USERNAME)
 
         default_last_time = datetime.min.replace(tzinfo=None)
 
